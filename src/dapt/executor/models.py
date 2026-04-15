@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 ActionKind = Literal["tool", "skill"]
 ExecutionStatus = Literal["pending", "running", "succeeded", "failed"]
+SkillStepStatus = Literal["succeeded", "failed", "skipped"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,3 +60,14 @@ class ExecutionResult:
     attempts: int = 0
     error_message: str | None = None
     completed_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SkillStepRecord:
+    """Structured record of one skill step execution outcome."""
+
+    name: str
+    tool_name: str
+    status: SkillStepStatus
+    effects: dict[str, Any] = field(default_factory=dict)
+    error_message: str | None = None

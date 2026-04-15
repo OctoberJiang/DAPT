@@ -32,10 +32,22 @@ DAPT/
         - active/
         - failed
         - completed/
-    - references/   # external knowledge
+    - references/   # repo-local references and knowledge
+        - pentestgpt_v2_tool_skill_layer.md
+        - pentest/
+            - index.md
+            - manifest.json
+            - retrieval-contract.md
+            - tool-notes/
+            - playbooks/
+            - exploit-notes/
 - imgs/             # images for academic paper
 - prompts/          # prompts for each turn
 - src/              # source code
+    - dapt/
+        - executor/ # executor runtime, typed contracts, pentest tools/skills
+        - knowledge/ # typed knowledge manifest loader and contracts
+- tests/            # automated verification for executor and knowledge layers
 ```
 
 # Core Principles

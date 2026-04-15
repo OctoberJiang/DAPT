@@ -5,13 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .models import ExecutionRequest, ExecutionResult, OutputEnvelope
+from .models import ExecutionRequest, ExecutionResult, OutputEnvelope, SkillStepRecord
 
 Validator = Callable[[ExecutionRequest], None]
 ToolExecutor = Callable[[ExecutionRequest], OutputEnvelope]
 OutputParser = Callable[[OutputEnvelope], dict[str, Any]]
 ResultValidator = Callable[[ExecutionResult], None]
-ParameterBuilder = Callable[[ExecutionRequest], dict[str, Any]]
+ParameterBuilder = Callable[..., dict[str, Any]]
+StepPredicate = Callable[..., bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +51,7 @@ class SkillStepSpec:
     preconditions: tuple[Validator, ...] = ()
     success_hint: str | None = None
     on_failure: str = "stop"
+    run_if: StepPredicate | None = None
 
 
 @dataclass(frozen=True, slots=True)

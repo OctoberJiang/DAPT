@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
+from inspect import signature
 from typing import Any
 
 from .contracts import FieldSpec, SkillSpec, ToolSpec
@@ -14,7 +15,7 @@ from .errors import (
     SchemaValidationError,
     UnknownActionError,
 )
-from .models import ExecutionRequest, ExecutionResult, OutputEnvelope
+from .models import ExecutionRequest, ExecutionResult, OutputEnvelope, SkillStepRecord
 from .registry import SpecRegistry
 from .storage import ArtifactStoreLayout
 
@@ -243,14 +244,47 @@ class Executor:
         )
 
     def _execute_skill(self, *, spec: SkillSpec, request: ExecutionRequest) -> ExecutionResult:
-        self._run_validators(spec.validators, request)
-        self._validate_required_state(spec, request)
+        try:
+            self._run_validators(spec.validators, request)
+            self._validate_required_state(spec, request)
+        except (SchemaValidationError, PreconditionsFailedError, NonRetryableExecutionError) as exc:
+            output = OutputEnvelope(
+                stderr=str(exc),
+                metadata={"skill": spec.name, "step_records": []},
+            )
+            artifacts = self.artifact_store.persist_output(
+                request=request,
+                output=output,
+                artifact_name=spec.name,
+                attempt=1,
+            )
+            return self._failure_result(
+                request=request,
+                attempts=1,
+                output=output,
+                artifacts=artifacts,
+                error_message=str(exc),
+            )
 
         step_outputs: list[OutputEnvelope] = []
         all_artifacts = []
-        step_effects: list[dict[str, Any]] = []
+        step_records: list[SkillStepRecord] = []
 
         for step in spec.step_sequence:
+            if step.run_if is not None and not self._call_with_step_records(
+                step.run_if,
+                request,
+                step_records,
+            ):
+                step_records.append(
+                    SkillStepRecord(
+                        name=step.name,
+                        tool_name=step.tool_name,
+                        status="skipped",
+                    )
+                )
+                continue
+
             self._run_validators(step.preconditions, request, error_type=PreconditionsFailedError)
             tool_spec = self.registry.get_tool(step.tool_name)
             if tool_spec is None:
@@ -262,7 +296,11 @@ class Executor:
                 request,
                 action_kind="tool",
                 target_name=step.tool_name,
-                parameters=step.parameter_builder(request),
+                parameters=self._call_with_step_records(
+                    step.parameter_builder,
+                    request,
+                    step_records,
+                ),
             )
             normalized_step_request = self._normalize_request(
                 request=step_request,
@@ -277,10 +315,17 @@ class Executor:
             all_artifacts.extend(step_result.artifacts)
             if step_result.output is not None:
                 step_outputs.append(step_result.output)
-            if step_result.effects:
-                step_effects.append(step_result.effects)
+            step_records.append(
+                SkillStepRecord(
+                    name=step.name,
+                    tool_name=step.tool_name,
+                    status=step_result.status,
+                    effects=step_result.effects,
+                    error_message=step_result.error_message,
+                )
+            )
             if step_result.status != "succeeded" and step.on_failure != "continue":
-                combined_output = self._combine_outputs(step_outputs, step_effects, spec.name)
+                combined_output = self._combine_outputs(step_outputs, step_records, spec.name)
                 all_artifacts.extend(
                     self.artifact_store.persist_output(
                         request=request,
@@ -297,7 +342,7 @@ class Executor:
                     error_message=step_result.error_message or f"Skill step failed: {step.name}",
                 )
 
-        combined_output = self._combine_outputs(step_outputs, step_effects, spec.name)
+        combined_output = self._combine_outputs(step_outputs, step_records, spec.name)
         all_artifacts.extend(
             self.artifact_store.persist_output(
                 request=request,
@@ -338,6 +383,8 @@ class Executor:
         for field in input_schema:
             if field.required and field.name not in parameters:
                 raise SchemaValidationError(f"Missing required parameter: {field.name}")
+            if field.name in parameters and parameters[field.name] is None and not field.required:
+                continue
             if field.name in parameters and not self._matches_type(parameters[field.name], field):
                 raise SchemaValidationError(
                     f"Parameter '{field.name}' must be of type {field.type_name}"
@@ -385,7 +432,7 @@ class Executor:
     def _combine_outputs(
         self,
         outputs: list[OutputEnvelope],
-        step_effects: list[dict[str, Any]],
+        step_records: list[SkillStepRecord],
         skill_name: str,
     ) -> OutputEnvelope:
         stdout_parts = [output.stdout for output in outputs if output.stdout]
@@ -397,9 +444,20 @@ class Executor:
             metadata={
                 "skill": skill_name,
                 "step_count": len(outputs),
-                "step_effects": step_effects,
+                "step_effects": [record.effects for record in step_records if record.effects],
+                "step_records": [asdict(record) for record in step_records],
             },
         )
+
+    def _call_with_step_records(
+        self,
+        callable_obj,
+        request: ExecutionRequest,
+        step_records: list[SkillStepRecord],
+    ):
+        if len(signature(callable_obj).parameters) <= 1:
+            return callable_obj(request)
+        return callable_obj(request, tuple(step_records))
 
     def _failure_result(
         self,
