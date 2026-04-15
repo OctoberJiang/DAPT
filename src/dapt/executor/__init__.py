@@ -18,6 +18,7 @@ from .models import (
     ExecutionArtifact,
     ExecutionRequest,
     ExecutionResult,
+    ExecutionUsage,
     OutputEnvelope,
     SkillStepRecord,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "ExecutionArtifact",
     "ExecutionRequest",
     "ExecutionResult",
+    "ExecutionUsage",
     "FieldSpec",
     "make_asrep_roast_collection_skill",
     "build_pentest_registry",

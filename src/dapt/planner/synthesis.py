@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from hashlib import sha1
+from time import perf_counter
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
 
@@ -14,6 +15,7 @@ from dapt.memory import MemorySearchHit
 
 from .llm import (
     OpenAICompatiblePlannerLLM,
+    PlannerLLMCompletion,
     PlannerLLM,
     PlannerLLMConfig,
     PlannerLLMError,
@@ -54,6 +56,11 @@ class HypothesisTrace:
     model: str | None
     prompt: str | None
     raw_response: str | None
+    llm_prompt_tokens: int | None
+    llm_completion_tokens: int | None
+    llm_total_tokens: int | None
+    llm_cost_cny: float | None
+    llm_latency_seconds: float | None
     parsed_payload: dict[str, Any] | None
     validation_issues: tuple[str, ...]
     fallback_reason: str | None
@@ -69,6 +76,11 @@ class HypothesisTrace:
             "model": self.model,
             "prompt": self.prompt,
             "raw_response": self.raw_response,
+            "llm_prompt_tokens": self.llm_prompt_tokens,
+            "llm_completion_tokens": self.llm_completion_tokens,
+            "llm_total_tokens": self.llm_total_tokens,
+            "llm_cost_cny": self.llm_cost_cny,
+            "llm_latency_seconds": self.llm_latency_seconds,
             "parsed_payload": self.parsed_payload,
             "validation_issues": list(self.validation_issues),
             "fallback_reason": self.fallback_reason,
@@ -296,6 +308,11 @@ class CandidateSynthesizer:
                     model=self.llm_config.model if self.llm_config is not None else None,
                     prompt=None,
                     raw_response=None,
+                    llm_prompt_tokens=None,
+                    llm_completion_tokens=None,
+                    llm_total_tokens=None,
+                    llm_cost_cny=None,
+                    llm_latency_seconds=None,
                     parsed_payload=None,
                     validation_issues=(),
                     fallback_reason="llm-disabled-or-unconfigured",
@@ -313,16 +330,25 @@ class CandidateSynthesizer:
             memory_hits=memory_hits,
         )
         raw_response: str | None = None
+        completion: PlannerLLMCompletion | None = None
         parsed_payload: dict[str, Any] | None = None
         issues: list[str] = []
         llm_proposals: tuple[CandidateProposal, ...] = ()
         fallback_reason: str | None = None
+        llm_latency_seconds: float | None = None
+        llm_cost_cny: float | None = None
         try:
-            raw_response = self.llm.complete(
+            started_at = perf_counter()
+            llm_response = self.llm.complete(
                 config=self.llm_config,
                 system_prompt=_SYSTEM_PROMPT,
                 user_prompt=prompt,
             )
+            llm_latency_seconds = perf_counter() - started_at
+            completion = _normalize_completion(llm_response)
+            raw_response = completion.content
+            if completion.usage is not None and self.llm_config.pricing is not None:
+                llm_cost_cny = self.llm_config.pricing.estimate_cost_cny(completion.usage)
             parsed_payload = _extract_json_payload(raw_response)
             llm_proposals, issues = self._validate_llm_candidates(
                 payload=parsed_payload,
@@ -351,6 +377,13 @@ class CandidateSynthesizer:
                 model=self.llm_config.model,
                 prompt=prompt,
                 raw_response=raw_response,
+                llm_prompt_tokens=None if completion is None or completion.usage is None else completion.usage.prompt_tokens,
+                llm_completion_tokens=None
+                if completion is None or completion.usage is None
+                else completion.usage.completion_tokens,
+                llm_total_tokens=None if completion is None or completion.usage is None else completion.usage.total_tokens,
+                llm_cost_cny=llm_cost_cny,
+                llm_latency_seconds=llm_latency_seconds,
                 parsed_payload=parsed_payload,
                 validation_issues=tuple(issues),
                 fallback_reason=fallback_reason,
@@ -359,7 +392,6 @@ class CandidateSynthesizer:
                 proposal_keys=tuple(proposal.candidate_key for proposal in merged),
             ),
         )
-
     def ingest(
         self,
         *,
@@ -1011,6 +1043,12 @@ def _proposal_signature(proposal: CandidateProposal) -> str:
         },
         sort_keys=True,
     )
+
+
+def _normalize_completion(response: str | PlannerLLMCompletion) -> PlannerLLMCompletion:
+    if isinstance(response, PlannerLLMCompletion):
+        return response
+    return PlannerLLMCompletion(content=response)
 
 
 def _extract_json_payload(raw_text: str) -> dict[str, Any]:

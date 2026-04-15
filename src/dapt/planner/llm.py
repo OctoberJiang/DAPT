@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping as MappingABC
 import json
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Mapping, Protocol
@@ -24,6 +25,36 @@ class PlannerLLMTransportError(PlannerLLMError):
 
 
 @dataclass(frozen=True, slots=True)
+class PlannerLLMUsage:
+    """Provider-reported token usage for one completion call."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerLLMPricing:
+    """Repo-visible token pricing used for CNY cost accounting."""
+
+    input_cost_cny_per_1k_tokens: float = 0.0
+    output_cost_cny_per_1k_tokens: float = 0.0
+
+    def estimate_cost_cny(self, usage: PlannerLLMUsage) -> float:
+        input_cost = (usage.prompt_tokens / 1000.0) * self.input_cost_cny_per_1k_tokens
+        output_cost = (usage.completion_tokens / 1000.0) * self.output_cost_cny_per_1k_tokens
+        return round(input_cost + output_cost, 6)
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerLLMCompletion:
+    """One planner LLM completion plus optional usage metadata."""
+
+    content: str
+    usage: PlannerLLMUsage | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class PlannerLLMConfig:
     """Normalized repo-visible config contract for planner hypothesis generation."""
 
@@ -37,6 +68,7 @@ class PlannerLLMConfig:
     timeout_seconds: float = 30.0
     enabled: bool = True
     extra_headers: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    pricing: PlannerLLMPricing | None = None
 
     def without_secret(self) -> PlannerLLMConfig:
         """Return a redacted view suitable for artifact persistence."""
@@ -53,7 +85,7 @@ class PlannerLLM(Protocol):
         config: PlannerLLMConfig,
         system_prompt: str,
         user_prompt: str,
-    ) -> str:
+    ) -> str | PlannerLLMCompletion:
         """Return the raw text response for the given prompt."""
 
 
@@ -100,6 +132,7 @@ def normalize_planner_llm_config(
         ),
         enabled=enabled,
         extra_headers=_normalize_extra_headers(raw.get("extra_headers", ())),
+        pricing=_normalize_pricing(raw, resolved_env),
     )
     if not normalized.enabled:
         return normalized
@@ -126,7 +159,7 @@ class OpenAICompatiblePlannerLLM:
         config: PlannerLLMConfig,
         system_prompt: str,
         user_prompt: str,
-    ) -> str:
+    ) -> PlannerLLMCompletion:
         if not config.enabled:
             raise PlannerLLMConfigurationError("Planner LLM config is disabled.")
         if not config.api_key:
@@ -165,7 +198,10 @@ class OpenAICompatiblePlannerLLM:
         except TimeoutError as exc:
             raise PlannerLLMTransportError("Planner provider request timed out.") from exc
         try:
-            return _extract_message_content(payload)
+            return PlannerLLMCompletion(
+                content=_extract_message_content(payload),
+                usage=_extract_usage(payload),
+            )
         except (KeyError, TypeError, ValueError) as exc:
             raise PlannerLLMTransportError("Planner provider returned an unexpected response payload.") from exc
 
@@ -224,7 +260,7 @@ def _coerce_int(value: Any) -> int:
 def _normalize_extra_headers(raw_headers: Any) -> tuple[tuple[str, str], ...]:
     if raw_headers in (None, ""):
         return ()
-    if isinstance(raw_headers, Mapping):
+    if isinstance(raw_headers, MappingABC):
         return tuple((str(key), str(value)) for key, value in sorted(raw_headers.items()))
     normalized: list[tuple[str, str]] = []
     for entry in raw_headers:
@@ -233,3 +269,56 @@ def _normalize_extra_headers(raw_headers: Any) -> tuple[tuple[str, str], ...]:
         normalized.append((str(entry[0]), str(entry[1])))
     normalized.sort()
     return tuple(normalized)
+
+
+def _normalize_pricing(raw: Mapping[str, Any], env: Mapping[str, str]) -> PlannerLLMPricing | None:
+    pricing_payload = raw.get("pricing")
+    if pricing_payload is None:
+        input_value = raw.get(
+            "input_cost_cny_per_1k_tokens",
+            env.get("DAPT_PLANNER_INPUT_COST_CNY_PER_1K_TOKENS"),
+        )
+        output_value = raw.get(
+            "output_cost_cny_per_1k_tokens",
+            env.get("DAPT_PLANNER_OUTPUT_COST_CNY_PER_1K_TOKENS"),
+        )
+    else:
+        if not isinstance(pricing_payload, MappingABC):
+            raise PlannerLLMConfigurationError("pricing must be a mapping when provided.")
+        input_value = pricing_payload.get("input_cost_cny_per_1k_tokens")
+        output_value = pricing_payload.get("output_cost_cny_per_1k_tokens")
+
+    if input_value in (None, "") and output_value in (None, ""):
+        return None
+
+    input_cost = _coerce_float(input_value if input_value not in (None, "") else 0.0)
+    output_cost = _coerce_float(output_value if output_value not in (None, "") else 0.0)
+    if input_cost < 0 or output_cost < 0:
+        raise PlannerLLMConfigurationError("pricing values must be non-negative.")
+    return PlannerLLMPricing(
+        input_cost_cny_per_1k_tokens=input_cost,
+        output_cost_cny_per_1k_tokens=output_cost,
+    )
+
+
+def _extract_usage(payload: dict[str, Any]) -> PlannerLLMUsage | None:
+    usage_payload = payload.get("usage")
+    if not isinstance(usage_payload, MappingABC):
+        return None
+
+    prompt_tokens = _coerce_optional_int(usage_payload.get("prompt_tokens"))
+    completion_tokens = _coerce_optional_int(usage_payload.get("completion_tokens"))
+    total_tokens = _coerce_optional_int(usage_payload.get("total_tokens"))
+    if total_tokens is None:
+        total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
+    return PlannerLLMUsage(
+        prompt_tokens=prompt_tokens or 0,
+        completion_tokens=completion_tokens or 0,
+        total_tokens=total_tokens,
+    )
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    return _coerce_int(value)

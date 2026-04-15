@@ -18,6 +18,7 @@ None currently.
 - `2_6_llm-driven-hypothesis-and-provider-config`: LLM-backed hypothesis generation, provider/config normalization, auditable hypothesis traces, and deterministic validation/fallback tests are in place and awaiting audit.
 - `2_7_recon-bootstrap-from-minimal-input`: URL-only planner startup, repo-local bootstrap defaults, recon-first missing-state analysis, and deterministic bootstrap tests are in place and awaiting audit.
 - `2_8_mode-aware-objectives-and-success-termination`: objective-mode contracts, explicit CTF/root success tracking, objective-progress artifacts, and deterministic objective-aware termination tests are in place and awaiting audit.
+- `2_9_planner-budget-and-cost-control`: planner-session budget tracking, CNY-denominated LLM cost accounting, hard budget-stop limits, and deterministic budget tests are in place and awaiting audit.
 - `3_1_contracts-and-layout`: executor package layout, typed contracts, and artifact storage conventions are in place and awaiting audit.
 - `3_2_executor-runtime`: executor dispatch, retry policy, and raw-output persistence are in place and awaiting audit.
 - `3_3_reference-aligned-proofs`: concrete tool/skill proofs and executor tests are in place and awaiting audit.

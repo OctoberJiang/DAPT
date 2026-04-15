@@ -47,6 +47,14 @@ class ExecutionArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionUsage:
+    """Resource usage measured during one execution request."""
+
+    tool_invocations: int = 0
+    elapsed_seconds: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionResult:
     """Execution-layer result passed forward without summarizing attack meaning."""
 
@@ -60,6 +68,7 @@ class ExecutionResult:
     attempts: int = 0
     error_message: str | None = None
     completed_at: datetime | None = None
+    usage: ExecutionUsage | None = None
 
 
 @dataclass(frozen=True, slots=True)

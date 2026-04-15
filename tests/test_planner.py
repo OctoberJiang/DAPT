@@ -20,6 +20,9 @@ from dapt.planner import (
     CandidateSynthesizer,
     Planner,
     PlannerArtifactStore,
+    PlannerBudgetLimits,
+    PlannerLLMCompletion,
+    PlannerLLMUsage,
     SearchTreeState,
     normalize_planner_llm_config,
 )
@@ -225,7 +228,7 @@ class _FakePlannerExecutor:
 
 
 class _FakePlannerLLM:
-    def __init__(self, responses: list[str]) -> None:
+    def __init__(self, responses: list[object]) -> None:
         self.responses = list(responses)
         self.calls: list[dict[str, str]] = []
 
@@ -261,6 +264,27 @@ class PlannerLLMConfigTests(unittest.TestCase):
         self.assertEqual(config.api_base_url, "https://example.invalid/v1")
         self.assertEqual(config.api_key, "secret-token")
         self.assertEqual(config.api_key_env_var, "CUSTOM_PLANNER_KEY")
+
+    def test_normalize_reads_cny_pricing(self) -> None:
+        config = normalize_planner_llm_config(
+            {
+                "provider": "openai",
+                "model": "gpt-test",
+                "api_base_url": "https://example.invalid/v1",
+                "api_key": "secret-token",
+                "pricing": {
+                    "input_cost_cny_per_1k_tokens": 0.5,
+                    "output_cost_cny_per_1k_tokens": 1.5,
+                },
+            }
+        )
+
+        self.assertIsNotNone(config)
+        assert config is not None
+        self.assertIsNotNone(config.pricing)
+        assert config.pricing is not None
+        self.assertEqual(config.pricing.input_cost_cny_per_1k_tokens, 0.5)
+        self.assertEqual(config.pricing.output_cost_cny_per_1k_tokens, 1.5)
 
 
 class CandidateSynthesizerLLMTests(unittest.TestCase):
@@ -399,6 +423,61 @@ class CandidateSynthesizerLLMTests(unittest.TestCase):
         self.assertTrue(result.proposals)
         self.assertTrue(any("not supported by the selected knowledge docs" in issue for issue in result.trace.validation_issues))
 
+    def test_generate_records_llm_usage_and_cny_cost(self) -> None:
+        synthesizer = CandidateSynthesizer(
+            self.manifest,
+            llm=_FakePlannerLLM(
+                responses=[
+                    PlannerLLMCompletion(
+                        content=json.dumps(
+                            {
+                                "candidates": [
+                                    {
+                                        "title": "Map the reachable web surface",
+                                        "hypothesis": "The target URL should be mapped before deeper web follow-ups.",
+                                        "action_kind": "skill",
+                                        "target_name": "web-surface-mapping",
+                                        "goal": "Confirm the reachable web surface and collect baseline findings.",
+                                        "knowledge_doc_ids": ["web-surface-mapping"],
+                                        "supporting_evidence": ["state:target_url"],
+                                        "prerequisites": ["state:target-url", "state:target-host"],
+                                        "effects": ["effect:web-surface-confirmed"],
+                                    }
+                                ]
+                            }
+                        ),
+                        usage=PlannerLLMUsage(
+                            prompt_tokens=100,
+                            completion_tokens=50,
+                            total_tokens=150,
+                        ),
+                    )
+                ]
+            ),
+            llm_config={
+                "provider": "openai",
+                "model": "gpt-test",
+                "api_base_url": "https://example.invalid/v1",
+                "api_key": "secret",
+                "pricing": {
+                    "input_cost_cny_per_1k_tokens": 0.5,
+                    "output_cost_cny_per_1k_tokens": 1.5,
+                },
+            },
+        )
+
+        result = synthesizer.generate(
+            tree=self.tree,
+            graph=self.graph,
+            current_state=self.current_state,
+            observation=self.tree.nodes[self.tree.root_node_id],
+        )
+
+        self.assertEqual(result.trace.llm_prompt_tokens, 100)
+        self.assertEqual(result.trace.llm_completion_tokens, 50)
+        self.assertEqual(result.trace.llm_total_tokens, 150)
+        self.assertAlmostEqual(result.trace.llm_cost_cny or 0.0, 0.125, places=6)
+
 
 class PlannerRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -506,6 +585,128 @@ class PlannerRuntimeTests(unittest.TestCase):
         self.assertTrue((self.repo_root / "artifacts/planner/planner-sess-3-example-test/turn-0001.json").exists())
         self.assertTrue((self.repo_root / "artifacts/planner/planner-sess-3-example-test/bootstrap-obs-0001.json").exists())
         self.assertTrue((self.repo_root / "artifacts/planner/planner-sess-3-example-test/hypothesis-trace-obs-0001.json").exists())
+        self.assertTrue((self.repo_root / "artifacts/planner/planner-sess-3-example-test/budget.json").exists())
+
+    def test_budget_limit_stops_after_first_execution(self) -> None:
+        planner = Planner(
+            repo_root=self.repo_root,
+            registry=self.registry,
+            executor=_FakePlannerExecutor(
+                responses=[
+                    {
+                        "target_name": "web-surface-mapping",
+                        "stdout": "80/tcp open http nginx 1.24.0\nVisit https://example.test/ (Status: 200)",
+                        "metadata": {"source_type": "web"},
+                    }
+                ]
+            ),  # type: ignore[arg-type]
+            perceptor=self.perceptor,
+            artifact_store=PlannerArtifactStore(repo_root=self.repo_root),
+            knowledge_manifest=load_knowledge_manifest(self.knowledge_repo_root),
+            bootstrap_policy=BootstrapPolicy(repo_root=self.knowledge_repo_root),
+            budget_limits=PlannerBudgetLimits(max_tool_calls=1),
+            max_turns=4,
+        )
+        session = planner.start_session(
+            session_id="planner-sess-budget-tool",
+            target_url="https://example.test",
+        )
+
+        record = planner.run_turn(session)
+        budget_snapshot = json.loads(
+            (self.repo_root / "artifacts/planner/planner-sess-budget-tool-example-test/budget.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertEqual(record.status, "executed")
+        self.assertTrue(session.completed)
+        self.assertEqual(session.termination_reason, "budget-limit-reached")
+        self.assertEqual(budget_snapshot["usage"]["tool_calls"], 1)
+        self.assertEqual(budget_snapshot["limit_hit"]["limit_name"], "tool_calls")
+
+    def test_budget_limit_stops_before_execution_when_llm_cost_reaches_cap(self) -> None:
+        synthesizer = CandidateSynthesizer(
+            load_knowledge_manifest(self.knowledge_repo_root),
+            llm=_FakePlannerLLM(
+                responses=[
+                    PlannerLLMCompletion(
+                        content=json.dumps(
+                            {
+                                "candidates": [
+                                    {
+                                        "title": "Map the reachable web surface",
+                                        "hypothesis": "The target URL should be mapped before deeper web follow-ups.",
+                                        "action_kind": "skill",
+                                        "target_name": "web-surface-mapping",
+                                        "goal": "Confirm the reachable web surface and collect baseline findings.",
+                                        "knowledge_doc_ids": ["web-surface-mapping"],
+                                        "supporting_evidence": ["state:target_url"],
+                                        "prerequisites": ["state:target-url", "state:target-host"],
+                                        "effects": ["effect:web-surface-confirmed"],
+                                    }
+                                ]
+                            }
+                        ),
+                        usage=PlannerLLMUsage(
+                            prompt_tokens=100,
+                            completion_tokens=50,
+                            total_tokens=150,
+                        ),
+                    )
+                ]
+            ),
+            llm_config={
+                "provider": "openai",
+                "model": "gpt-test",
+                "api_base_url": "https://example.invalid/v1",
+                "api_key": "secret",
+                "pricing": {
+                    "input_cost_cny_per_1k_tokens": 0.5,
+                    "output_cost_cny_per_1k_tokens": 1.5,
+                },
+            },
+        )
+        fake_executor = _FakePlannerExecutor(
+            responses=[
+                {
+                    "target_name": "web-surface-mapping",
+                    "stdout": "should-not-run",
+                    "metadata": {"source_type": "web"},
+                }
+            ]
+        )
+        planner = Planner(
+            repo_root=self.repo_root,
+            registry=self.registry,
+            executor=fake_executor,  # type: ignore[arg-type]
+            perceptor=self.perceptor,
+            artifact_store=PlannerArtifactStore(repo_root=self.repo_root),
+            knowledge_manifest=load_knowledge_manifest(self.knowledge_repo_root),
+            synthesizer=synthesizer,
+            bootstrap_policy=BootstrapPolicy(repo_root=self.knowledge_repo_root),
+            budget_limits=PlannerBudgetLimits(max_llm_cost_cny=0.1),
+            max_turns=4,
+        )
+        session = planner.start_session(
+            session_id="planner-sess-budget-llm",
+            target_url="https://example.test",
+        )
+
+        record = planner.run_turn(session)
+        budget_snapshot = json.loads(
+            (self.repo_root / "artifacts/planner/planner-sess-budget-llm-example-test/budget.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertEqual(record.status, "stopped")
+        self.assertEqual(record.termination_reason, "budget-limit-reached")
+        self.assertTrue(session.completed)
+        self.assertEqual(session.termination_reason, "budget-limit-reached")
+        self.assertFalse(fake_executor.requests)
+        self.assertAlmostEqual(budget_snapshot["usage"]["llm_cost_cny"], 0.125, places=6)
+        self.assertEqual(budget_snapshot["limit_hit"]["limit_name"], "llm_cost_cny")
 
     def test_ctf_mode_stops_when_flag_is_observed(self) -> None:
         planner = Planner(

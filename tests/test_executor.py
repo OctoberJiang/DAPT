@@ -100,6 +100,10 @@ class ExecutorProofTests(unittest.TestCase):
         self.assertEqual(result.attempts, 2)
         self.assertEqual(result.output.stdout, "recovered")
         self.assertEqual(calls["count"], 2)
+        self.assertIsNotNone(result.usage)
+        assert result.usage is not None
+        self.assertEqual(result.usage.tool_invocations, 2)
+        self.assertGreaterEqual(result.usage.elapsed_seconds, 0.0)
 
     def test_artifact_persistence_writes_output_files(self) -> None:
         request = ExecutionRequest(
@@ -141,6 +145,9 @@ class ExecutorProofTests(unittest.TestCase):
         self.assertEqual(result.effects["step_count"], 2)
         self.assertIn("directory-listing", result.effects["produced_effects"])
         self.assertGreaterEqual(len(result.artifacts), 9)
+        self.assertIsNotNone(result.usage)
+        assert result.usage is not None
+        self.assertEqual(result.usage.tool_invocations, 2)
 
     def test_skill_failure_propagates_failed_step(self) -> None:
         request = ExecutionRequest(
@@ -510,6 +517,9 @@ class PentestWebSkillTests(unittest.TestCase):
         self.assertEqual(result.effects["steps_run"], ["discover-http-services", "baseline-web-scan"])
         self.assertTrue(result.effects["http_exposed"])
         self.assertEqual(result.effects["zap_alert_counts"]["warn"], 1)
+        self.assertIsNotNone(result.usage)
+        assert result.usage is not None
+        self.assertEqual(result.usage.tool_invocations, 2)
         executed_tools = [call.args[0][0] for call in run_mock.call_args_list]
         self.assertEqual(executed_tools, ["nmap", "zap-baseline.py"])
 

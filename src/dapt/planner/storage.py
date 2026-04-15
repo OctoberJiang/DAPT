@@ -139,6 +139,22 @@ class PlannerArtifactStore:
             payload=payload,
         )
 
+    def persist_budget_snapshot(
+        self,
+        *,
+        session_id: str,
+        target_name: str,
+        payload: dict[str, Any],
+    ) -> PlannerArtifact:
+        """Persist the current budget and usage tracker snapshot."""
+
+        return self._write_json(
+            session_id=session_id,
+            target_name=target_name,
+            artifact_name="budget",
+            payload=payload,
+        )
+
     def persist_turn_record(
         self,
         *,

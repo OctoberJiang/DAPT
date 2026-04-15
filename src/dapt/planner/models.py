@@ -27,6 +27,7 @@ PlannerTerminationReason = Literal[
     "no-actionable-candidates",
     "frontier-blocked",
     "max-turns-reached",
+    "budget-limit-reached",
 ]
 
 

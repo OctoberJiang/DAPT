@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from inspect import signature
+from time import perf_counter
 from typing import Any
 
 from .contracts import FieldSpec, SkillSpec, ToolSpec
@@ -15,7 +16,7 @@ from .errors import (
     SchemaValidationError,
     UnknownActionError,
 )
-from .models import ExecutionRequest, ExecutionResult, OutputEnvelope, SkillStepRecord
+from .models import ExecutionRequest, ExecutionResult, ExecutionUsage, OutputEnvelope, SkillStepRecord
 from .registry import SpecRegistry
 from .storage import ArtifactStoreLayout
 
@@ -78,6 +79,7 @@ class Executor:
         request: ExecutionRequest,
         step_name: str | None = None,
     ) -> ExecutionResult:
+        started_at = perf_counter()
         attempts = 0
         persisted_artifacts: list = []
         try:
@@ -110,6 +112,10 @@ class Executor:
                 output=error_output,
                 artifacts=persisted_artifacts,
                 error_message=str(exc),
+                usage=ExecutionUsage(
+                    tool_invocations=0,
+                    elapsed_seconds=self._elapsed_since(started_at),
+                ),
             )
 
         while attempts <= self.max_retries:
@@ -137,6 +143,10 @@ class Executor:
                         output=error_output,
                         artifacts=persisted_artifacts,
                         error_message=str(exc),
+                        usage=ExecutionUsage(
+                            tool_invocations=attempts,
+                            elapsed_seconds=self._elapsed_since(started_at),
+                        ),
                     )
                 continue
             except (SchemaValidationError, PreconditionsFailedError, NonRetryableExecutionError) as exc:
@@ -159,6 +169,10 @@ class Executor:
                     output=error_output,
                     artifacts=persisted_artifacts,
                     error_message=str(exc),
+                    usage=ExecutionUsage(
+                        tool_invocations=attempts,
+                        elapsed_seconds=self._elapsed_since(started_at),
+                    ),
                 )
             except Exception as exc:
                 error_output = OutputEnvelope(
@@ -180,6 +194,10 @@ class Executor:
                     output=error_output,
                     artifacts=persisted_artifacts,
                     error_message=str(exc),
+                    usage=ExecutionUsage(
+                        tool_invocations=attempts,
+                        elapsed_seconds=self._elapsed_since(started_at),
+                    ),
                 )
 
             persisted_artifacts.extend(
@@ -204,6 +222,10 @@ class Executor:
                     effects=effects,
                     attempts=attempts,
                     completed_at=datetime.now(UTC),
+                    usage=ExecutionUsage(
+                        tool_invocations=attempts,
+                        elapsed_seconds=self._elapsed_since(started_at),
+                    ),
                 )
                 self._run_result_validators(spec.postconditions, result)
                 return result
@@ -215,6 +237,10 @@ class Executor:
                         output=output,
                         artifacts=persisted_artifacts,
                         error_message=str(exc),
+                        usage=ExecutionUsage(
+                            tool_invocations=attempts,
+                            elapsed_seconds=self._elapsed_since(started_at),
+                        ),
                     )
                 continue
             except (SchemaValidationError, PreconditionsFailedError, NonRetryableExecutionError) as exc:
@@ -224,6 +250,10 @@ class Executor:
                     output=output,
                     artifacts=persisted_artifacts,
                     error_message=str(exc),
+                    usage=ExecutionUsage(
+                        tool_invocations=attempts,
+                        elapsed_seconds=self._elapsed_since(started_at),
+                    ),
                 )
             except Exception as exc:
                 return self._failure_result(
@@ -232,6 +262,10 @@ class Executor:
                     output=output,
                     artifacts=persisted_artifacts,
                     error_message=str(exc),
+                    usage=ExecutionUsage(
+                        tool_invocations=attempts,
+                        elapsed_seconds=self._elapsed_since(started_at),
+                    ),
                 )
 
         unreachable_error = "Executor exhausted retry loop unexpectedly"
@@ -241,9 +275,14 @@ class Executor:
             output=OutputEnvelope(stderr=unreachable_error),
             artifacts=persisted_artifacts,
             error_message=unreachable_error,
+            usage=ExecutionUsage(
+                tool_invocations=attempts,
+                elapsed_seconds=self._elapsed_since(started_at),
+            ),
         )
 
     def _execute_skill(self, *, spec: SkillSpec, request: ExecutionRequest) -> ExecutionResult:
+        started_at = perf_counter()
         try:
             self._run_validators(spec.validators, request)
             self._validate_required_state(spec, request)
@@ -264,11 +303,16 @@ class Executor:
                 output=output,
                 artifacts=artifacts,
                 error_message=str(exc),
+                usage=ExecutionUsage(
+                    tool_invocations=0,
+                    elapsed_seconds=self._elapsed_since(started_at),
+                ),
             )
 
         step_outputs: list[OutputEnvelope] = []
         all_artifacts = []
         step_records: list[SkillStepRecord] = []
+        total_tool_invocations = 0
 
         for step in spec.step_sequence:
             if step.run_if is not None and not self._call_with_step_records(
@@ -315,6 +359,8 @@ class Executor:
             all_artifacts.extend(step_result.artifacts)
             if step_result.output is not None:
                 step_outputs.append(step_result.output)
+            if step_result.usage is not None:
+                total_tool_invocations += step_result.usage.tool_invocations
             step_records.append(
                 SkillStepRecord(
                     name=step.name,
@@ -340,6 +386,10 @@ class Executor:
                     output=combined_output,
                     artifacts=all_artifacts,
                     error_message=step_result.error_message or f"Skill step failed: {step.name}",
+                    usage=ExecutionUsage(
+                        tool_invocations=total_tool_invocations,
+                        elapsed_seconds=self._elapsed_since(started_at),
+                    ),
                 )
 
         combined_output = self._combine_outputs(step_outputs, step_records, spec.name)
@@ -365,6 +415,10 @@ class Executor:
             effects=effects,
             attempts=1,
             completed_at=datetime.now(UTC),
+            usage=ExecutionUsage(
+                tool_invocations=total_tool_invocations,
+                elapsed_seconds=self._elapsed_since(started_at),
+            ),
         )
 
     def _normalize_request(
@@ -467,6 +521,7 @@ class Executor:
         output: OutputEnvelope,
         artifacts,
         error_message: str,
+        usage: ExecutionUsage,
     ) -> ExecutionResult:
         return ExecutionResult(
             request_id=request.request_id,
@@ -478,4 +533,8 @@ class Executor:
             attempts=attempts,
             error_message=error_message,
             completed_at=datetime.now(UTC),
+            usage=usage,
         )
+
+    def _elapsed_since(self, started_at: float) -> float:
+        return perf_counter() - started_at

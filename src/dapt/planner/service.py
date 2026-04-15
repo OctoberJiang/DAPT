@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from time import perf_counter
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
@@ -12,6 +13,7 @@ from dapt.memory import MemoryArtifactStore, MemoryQuery, MemoryStore
 from dapt.perceptor import PerceptionResult, Perceptor
 
 from .bootstrap import BootstrapPolicy
+from .budget import PlannerBudgetLimits, PlannerBudgetTracker
 from .llm import PlannerLLM, PlannerLLMConfig
 from .models import PlannerTerminationReason, PlannerTurnRecord
 from .objectives import (
@@ -44,6 +46,7 @@ class PlannerSession:
     termination_reason: PlannerTerminationReason | None = None
     success_conditions: tuple[str, ...] = ()
     objective: CampaignObjective | None = None
+    budget_tracker: PlannerBudgetTracker = field(default_factory=PlannerBudgetTracker)
 
     def next_request_id(self) -> str:
         self.request_counter += 1
@@ -69,6 +72,7 @@ class PlannerSession:
                 "success_indicators": self.objective.success_indicators,
                 "partial_progress_markers": self.objective.partial_progress_markers,
             },
+            "budget": self.budget_tracker.snapshot(),
             "request_counter": self.request_counter,
             "turns": [asdict(turn) for turn in self.turns],
         }
@@ -97,6 +101,7 @@ class Planner:
         hypothesis_llm_config: PlannerLLMConfig | Mapping[str, Any] | None = None,
         bootstrap_policy: BootstrapPolicy | None = None,
         selector: PlannerDecisionEngine | None = None,
+        budget_limits: PlannerBudgetLimits | None = None,
         max_turns: int = 10,
     ) -> None:
         self.repo_root = repo_root
@@ -114,6 +119,7 @@ class Planner:
             llm_config=hypothesis_llm_config,
         )
         self.selector = selector or PlannerDecisionEngine(registry)
+        self.budget_limits = budget_limits or PlannerBudgetLimits()
         self.max_turns = max_turns
         self.artifact_store.initialize()
         self.memory_artifact_store.initialize()
@@ -162,6 +168,7 @@ class Planner:
             objective=build_campaign_objective(campaign_mode, objective_summary=objective_summary)
             if campaign_mode is not None
             else None,
+            budget_tracker=PlannerBudgetTracker(limits=self.budget_limits),
         )
         session.memory_store.add_record(
             kind="fact",
@@ -221,6 +228,13 @@ class Planner:
                 observation=observation,
                 memory_hits=memory_hits,
             )
+            session.budget_tracker.record_llm_usage(
+                prompt_tokens=result.trace.llm_prompt_tokens,
+                completion_tokens=result.trace.llm_completion_tokens,
+                total_tokens=result.trace.llm_total_tokens,
+                cost_cny=result.trace.llm_cost_cny,
+                latency_seconds=result.trace.llm_latency_seconds,
+            )
             session.memory_store.ingest_candidate_proposals(
                 observation_node_id=observation.node_id,
                 proposals=result.proposals,
@@ -247,6 +261,8 @@ class Planner:
             session.processed_observation_ids.add(observation.node_id)
             processed_any = True
             created += len(result.proposals)
+            if session.budget_tracker.limit_hit is not None:
+                break
         if processed_any:
             self.persist_session_state(session)
         return created
@@ -300,6 +316,14 @@ class Planner:
             self.persist_session_state(session)
             return record
 
+        budget_record = self._budget_stop_record(session)
+        if budget_record is not None:
+            session.turns.append(budget_record)
+            session.completed = True
+            session.termination_reason = "budget-limit-reached"
+            self.persist_session_state(session, turn_record=budget_record)
+            return budget_record
+
         self.synthesize_candidates(session)
         completion_reason, _objective_progress = self._completion_status(session)
         if completion_reason is not None:
@@ -315,11 +339,26 @@ class Planner:
             self.persist_session_state(session)
             return record
 
+        budget_record = self._budget_stop_record(session)
+        if budget_record is not None:
+            session.turns.append(budget_record)
+            session.completed = True
+            session.termination_reason = "budget-limit-reached"
+            self.persist_session_state(session, turn_record=budget_record)
+            return budget_record
+
         request, planned_record = self.plan_next_action(session)
         if request is None or planned_record is None:
             return session.turns[-1]
 
+        execution_started_at = perf_counter()
         execution_result = self.executor.execute(request)
+        execution_elapsed = perf_counter() - execution_started_at
+        session.budget_tracker.record_execution(
+            result=execution_result,
+            fallback_tool_invocations=1,
+            fallback_elapsed_seconds=execution_elapsed,
+        )
         perception = self.perceptor.perceive(
             execution_result,
             planner_node_id=request.planner_node_id,
@@ -355,6 +394,9 @@ class Planner:
         if completion_reason is not None:
             session.completed = True
             session.termination_reason = completion_reason
+        elif session.budget_tracker.limit_hit is not None:
+            session.completed = True
+            session.termination_reason = "budget-limit-reached"
         session.memory_store.ingest_memory_staging(perception.memory_record)
         session.memory_store.ingest_turn_result(
             turn_record=executed_record,
@@ -385,6 +427,11 @@ class Planner:
         self.artifact_store.persist_dependency_graph(session.graph)
         self.artifact_store.persist_candidate_rankings(session.graph)
         self.artifact_store.persist_session_snapshot(session)
+        self.artifact_store.persist_budget_snapshot(
+            session_id=session.session_id,
+            target_name=session.target_name,
+            payload=session.budget_tracker.snapshot(),
+        )
         self.memory_artifact_store.persist_store(session.memory_store)
         self.memory_artifact_store.persist_retrieval_index(session.memory_store)
         objective_progress = self._objective_progress(session)
@@ -419,6 +466,20 @@ class Planner:
 
     def _objective_progress(self, session: PlannerSession) -> ObjectiveProgress | None:
         return self.objective_tracker.evaluate(session)
+
+    def _budget_stop_record(self, session: PlannerSession) -> PlannerTurnRecord | None:
+        limit_hit = session.budget_tracker.evaluate()
+        if limit_hit is None:
+            return None
+        return PlannerTurnRecord(
+            turn_index=session.next_turn_index(),
+            status="stopped",
+            termination_reason="budget-limit-reached",
+            notes=(
+                f"Planner budget limit reached: {limit_hit.limit_name} "
+                f"{limit_hit.observed_value:.6f}/{limit_hit.limit_value:.6f}."
+            ),
+        )
 
     def _unsynthesized_observations(self, session: PlannerSession):
         observations = [
