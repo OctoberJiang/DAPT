@@ -1,5 +1,5 @@
 """DAPT package."""
 
-from . import executor, knowledge, perceptor
+from . import executor, knowledge, memory, perceptor, planner
 
-__all__ = ["executor", "knowledge", "perceptor"]
+__all__ = ["executor", "knowledge", "memory", "perceptor", "planner"]
