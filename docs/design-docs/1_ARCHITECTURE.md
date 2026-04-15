@@ -19,3 +19,8 @@ Multi-agent, respectively Planner, Executor, Perceptor.
 ## Sub-Plans
 
 > Naming Criteria: `1_X_<plan-name>`
+
+- `1_1_perceptor-contracts-and-artifacts`: completed Perceptor package layout, typed contracts, and repo-local artifact conventions.
+- `1_2_reference-aligned-parsing-runtime`: completed PentestGPT-reference-aligned parsing runtime for executor raw outputs.
+- `1_3_planner-feedback-and-memory-staging`: completed planner feedback envelope and append-only memory staging flow.
+- `1_4_perceptor-reference-aligned-proofs`: completed tests and proof fixtures that lock the Perceptor to the design and reference behavior.

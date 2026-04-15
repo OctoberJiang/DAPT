@@ -6,6 +6,10 @@
 
 ## Completed
 
+- `1_1_perceptor-contracts-and-artifacts`: Perceptor package layout, typed contracts, and repo-local artifact conventions are in place and awaiting audit.
+- `1_2_reference-aligned-parsing-runtime`: reference-aligned parsing runtime for executor raw outputs is in place and awaiting audit.
+- `1_3_planner-feedback-and-memory-staging`: planner feedback and append-only memory staging flow are in place and awaiting audit.
+- `1_4_perceptor-reference-aligned-proofs`: deterministic Perceptor tests and proof fixtures are in place and awaiting audit.
 - `3_1_contracts-and-layout`: executor package layout, typed contracts, and artifact storage conventions are in place and awaiting audit.
 - `3_2_executor-runtime`: executor dispatch, retry policy, and raw-output persistence are in place and awaiting audit.
 - `3_3_reference-aligned-proofs`: concrete tool/skill proofs and executor tests are in place and awaiting audit.
