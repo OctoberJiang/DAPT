@@ -6,4 +6,5 @@
 - `3_EXECUTION.md`: executor responsibilities, input/output contract, and retry boundary.
 - `4_MEMORY.md`: structured memory and retrieval design plus planner/Perceptor integration boundary.
 - `5_KNOWLEDGE.md`: reserved for knowledge design.
-- `6_EVALUATION.md`: reserved for evaluation design.
+- `6_EVALUATION.md`: XBOW-backed CTF evaluation design and future mode split.
+- `7_REPORT.md`: structured final reporting requirements and output controls.

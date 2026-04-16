@@ -6,6 +6,8 @@ None currently.
 
 ## Completed
 
+- `6_1_xbow-ctf-evaluation-runner`: repo-local XBOW benchmark discovery, selection, lifecycle orchestration, and evaluation artifact generation are in place and awaiting audit.
+- `7_1_structured-report-generation`: repo-local finding extraction, attack-chain summarization, format-specific rendering, and output-path selection are in place and awaiting audit.
 - `1_1_perceptor-contracts-and-artifacts`: Perceptor package layout, typed contracts, and repo-local artifact conventions are in place and awaiting audit.
 - `1_2_reference-aligned-parsing-runtime`: reference-aligned parsing runtime for executor raw outputs is in place and awaiting audit.
 - `1_3_planner-feedback-and-memory-staging`: planner feedback and append-only memory staging flow are in place and awaiting audit.
