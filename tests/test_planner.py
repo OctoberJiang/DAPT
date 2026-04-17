@@ -24,7 +24,9 @@ from dapt.planner import (
     PlannerLLMCompletion,
     PlannerLLMUsage,
     SearchTreeState,
+    enrich_state_from_observation,
     normalize_planner_llm_config,
+    state_to_conditions,
 )
 
 
@@ -306,6 +308,87 @@ class CandidateSynthesizerLLMTests(unittest.TestCase):
             satisfied_conditions=("state:target-url", "state:target-host"),
         )
 
+    def _add_action_observation(self, *, title: str, observation: str, evidence: EvidenceRecord):
+        hypothesis = self.tree.add_hypothesis(
+            parent_id=self.tree.root_node_id,
+            title=f"Hypothesis for {title}",
+            hypothesis="Trace the observation under test.",
+        )
+        action = self.tree.add_action(
+            parent_id=hypothesis.node_id,
+            title=f"Action for {title}",
+            action="Collect a deterministic test observation.",
+            request_id=f"req-{title.lower().replace(' ', '-')}",
+        )
+        return self.tree.add_observation(
+            parent_id=action.node_id,
+            title=title,
+            observation=observation,
+            evidence=evidence,
+        )
+
+    def test_enrich_state_reconstructs_candidate_url_from_discovered_web_path(self) -> None:
+        observation = self._add_action_observation(
+            title="Dashboard found",
+            observation="Discovered /dashboard",
+            evidence=EvidenceRecord(
+                status_codes=(302,),
+                file_paths=("/dashboard",),
+            ),
+        )
+
+        enriched = enrich_state_from_observation(self.current_state, observation)
+
+        self.assertEqual(enriched["observed_urls"], ["https://example.test/dashboard"])
+        self.assertEqual(enriched["sqli_candidate_url"], "https://example.test/dashboard")
+        self.assertIn("signal:sqli-candidate", state_to_conditions(enriched))
+
+    def test_enrich_state_ignores_irrelevant_or_non_web_paths_for_sqli_candidates(self) -> None:
+        observation = self._add_action_observation(
+            title="Irrelevant paths",
+            observation="Observed a favicon and a filesystem path",
+            evidence=EvidenceRecord(
+                status_codes=(200,),
+                file_paths=("/etc/passwd", "/favicon.ico"),
+            ),
+        )
+
+        enriched = enrich_state_from_observation(self.current_state, observation)
+
+        self.assertNotIn("sqli_candidate_url", enriched)
+        self.assertNotIn("signal:sqli-candidate", state_to_conditions(enriched))
+
+    def test_generate_emits_executable_sqli_candidate_for_reconstructed_path(self) -> None:
+        synthesizer = CandidateSynthesizer(self.manifest)
+        observation = self._add_action_observation(
+            title="Dashboard found",
+            observation="Content discovery found /dashboard after a redirect.",
+            evidence=EvidenceRecord(
+                status_codes=(302,),
+                file_paths=("/dashboard",),
+            ),
+        )
+        enriched_state = enrich_state_from_observation(self.current_state, observation)
+        self.graph.ingest_observation(
+            observation_node_id=observation.node_id,
+            evidence=observation.evidence,
+            satisfied_conditions=state_to_conditions(enriched_state),
+        )
+
+        result = synthesizer.generate(
+            tree=self.tree,
+            graph=self.graph,
+            current_state=enriched_state,
+            observation=observation,
+        )
+
+        sqli_candidate = next(
+            proposal for proposal in result.proposals if proposal.target_name == "sqli-verification"
+        )
+        self.assertEqual(result.trace.generation_mode, "fallback")
+        self.assertEqual(sqli_candidate.request_context["target_url"], "https://example.test/dashboard")
+        self.assertEqual(sqli_candidate.prerequisites, ("state:target-url", "signal:sqli-candidate"))
+
     def test_ingest_accepts_grounded_llm_candidate_and_persists_metadata(self) -> None:
         synthesizer = CandidateSynthesizer(
             self.manifest,
@@ -478,6 +561,42 @@ class CandidateSynthesizerLLMTests(unittest.TestCase):
         self.assertEqual(result.trace.llm_total_tokens, 150)
         self.assertAlmostEqual(result.trace.llm_cost_cny or 0.0, 0.125, places=6)
 
+    def test_generate_surfaces_ctf_benchmark_context_in_prompt(self) -> None:
+        llm = _FakePlannerLLM(responses=[json.dumps({"candidates": []})])
+        synthesizer = CandidateSynthesizer(
+            self.manifest,
+            llm=llm,
+            llm_config={
+                "provider": "openai",
+                "model": "gpt-test",
+                "api_base_url": "https://example.invalid/v1",
+                "api_key": "secret",
+            },
+        )
+
+        synthesizer.generate(
+            tree=self.tree,
+            graph=self.graph,
+            current_state={
+                **self.current_state,
+                "benchmark_metadata": {
+                    "benchmark_id": "XBEN-001-24",
+                    "name": "Benchmark Demo",
+                    "description": "Example challenge metadata.",
+                    "level": 2,
+                    "win_condition": "flag",
+                    "tags": ["web"],
+                },
+            },
+            observation=self.tree.nodes[self.tree.root_node_id],
+        )
+
+        prompt_payload = json.loads(llm.calls[0]["user_prompt"])
+
+        self.assertEqual(prompt_payload["benchmark_context"]["benchmark_id"], "XBEN-001-24")
+        self.assertEqual(prompt_payload["benchmark_context"]["description"], "Example challenge metadata.")
+        self.assertEqual(prompt_payload["current_state"]["benchmark_metadata"]["name"], "Benchmark Demo")
+
 
 class PlannerRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -548,6 +667,33 @@ class PlannerRuntimeTests(unittest.TestCase):
         self.assertTrue(session.current_state["wordlist_path"].endswith("docs/references/pentest/wordlists/web-content-common.txt"))
         self.assertTrue(Path(session.current_state["wordlist_path"]).exists())
         self.assertTrue((self.repo_root / bootstrap_trace).exists())
+
+    def test_start_session_keeps_benchmark_metadata_for_ctf_only(self) -> None:
+        benchmark_metadata = {
+            "benchmark_id": "XBEN-001-24",
+            "name": "Benchmark Demo",
+            "description": "Recover the flag from the demo service.",
+            "level": 2,
+            "win_condition": "flag",
+            "tags": ["web"],
+        }
+
+        ctf_session = self.planner.start_session(
+            session_id="planner-sess-ctf-metadata",
+            target_url="https://example.test",
+            campaign_mode="ctf",
+            benchmark_metadata=benchmark_metadata,
+        )
+        real_world_session = self.planner.start_session(
+            session_id="planner-sess-real-metadata",
+            target_url="https://example.test",
+            campaign_mode="real-world",
+            initial_context={"benchmark_metadata": {"name": "should-not-leak"}},
+            benchmark_metadata=benchmark_metadata,
+        )
+
+        self.assertEqual(ctf_session.current_state["benchmark_metadata"], benchmark_metadata)
+        self.assertNotIn("benchmark_metadata", real_world_session.current_state)
 
     def test_selection_builds_execution_request_for_best_candidate(self) -> None:
         session = self.planner.start_session(

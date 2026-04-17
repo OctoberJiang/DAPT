@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from dapt.executor.models import ExecutionArtifact, ExecutionResult
+from dapt.web_targets import reconstruct_web_urls
 
 from .contracts import ConversationLLM
 from .models import (
@@ -65,7 +66,10 @@ class Perceptor:
             planner_node_id=planner_node_id or execution_result.output and execution_result.output.metadata.get("planner_node_id"),
         )
         summary, trace = self.summarize_with_trace(raw_text=perception_input.raw_text, source=resolved_source)
-        evidence = self.extract_evidence(perception_input.raw_text)
+        evidence = self.extract_evidence(
+            perception_input.raw_text,
+            target_url=self._metadata_target_url(perception_input.metadata),
+        )
         planner_feedback = PlannerFeedback(
             request_id=perception_input.request_id,
             planner_node_id=perception_input.planner_node_id,
@@ -141,8 +145,8 @@ class Perceptor:
         )
         return self.build_prefix(source) + word_limit + chunk
 
-    def extract_evidence(self, raw_text: str) -> EvidenceRecord:
-        urls = tuple(sorted(set(re.findall(r"https?://[^\s'\"<>]+", raw_text))))
+    def extract_evidence(self, raw_text: str, *, target_url: str | None = None) -> EvidenceRecord:
+        observed_urls = set(re.findall(r"https?://[^\s'\"<>]+", raw_text))
         ports = tuple(sorted({int(match) for match in re.findall(r"\b(\d{1,5})/tcp\b", raw_text)}))
         status_codes = tuple(
             sorted(
@@ -152,9 +156,10 @@ class Perceptor:
                 }
             )
         )
-        file_paths = tuple(sorted(set(re.findall(r"(?:/[A-Za-z0-9._-]+)+", raw_text))))
+        file_paths = tuple(sorted(set(re.findall(r"(?<![A-Za-z0-9.:/])(?:/[A-Za-z0-9._-]+)+", raw_text))))
+        reconstructed_urls = reconstruct_web_urls(target_url=target_url, file_paths=file_paths)
         return EvidenceRecord(
-            urls=urls,
+            urls=tuple(sorted(observed_urls | set(reconstructed_urls))),
             ports=ports,
             status_codes=status_codes,
             file_paths=file_paths,
@@ -192,6 +197,13 @@ class Perceptor:
 
         return "\n".join(segment for segment in segments if segment).strip()
 
+    def _metadata_target_url(self, metadata: dict[str, object]) -> str | None:
+        output_metadata = metadata.get("output_metadata")
+        if not isinstance(output_metadata, dict):
+            return None
+        raw_value = output_metadata.get("request_target_url")
+        return str(raw_value).strip() if raw_value else None
+
     def _load_text_artifacts(self, artifacts: tuple[ExecutionArtifact, ...]) -> list[str]:
         loaded: list[str] = []
         for artifact in artifacts:
@@ -220,4 +232,3 @@ def build_perceptor(
         prompts=prompts,
         config=config,
     )
-

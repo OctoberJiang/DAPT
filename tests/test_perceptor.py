@@ -107,6 +107,35 @@ class PerceptorTests(unittest.TestCase):
         self.assertEqual(perception.planner_feedback.evidence.status_codes, (200, 403))
         self.assertIn("/admin", perception.planner_feedback.evidence.file_paths)
 
+    def test_perceive_reconstructs_absolute_urls_from_relative_paths(self) -> None:
+        llm = FakeConversationLLM(responses=["yes", "dashboard-summary"])
+        perceptor = Perceptor(
+            llm=llm,
+            artifact_store=PerceptorArtifactStore(repo_root=self.repo_root),
+        )
+        result = ExecutionResult(
+            request_id="req-3",
+            target_name="content-discovery",
+            action_kind="skill",
+            status="succeeded",
+            output=OutputEnvelope(
+                stdout="/dashboard (Status: 302)\n/favicon.ico (Status: 200)\n",
+                metadata={
+                    "source_type": "tool",
+                    "request_target_url": "https://example.test",
+                },
+            ),
+            attempts=1,
+        )
+
+        perception = perceptor.perceive(result, source="tool")
+
+        self.assertEqual(
+            perception.planner_feedback.evidence.urls,
+            ("https://example.test/dashboard", "https://example.test/favicon.ico"),
+        )
+        self.assertEqual(perception.planner_feedback.evidence.file_paths, ("/dashboard", "/favicon.ico"))
+
     def test_session_init_is_only_sent_once(self) -> None:
         llm = FakeConversationLLM(responses=["yes", "first", "second"])
         perceptor = Perceptor(

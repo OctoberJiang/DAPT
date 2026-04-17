@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from dapt.knowledge import KnowledgeLookupRequest, KnowledgeManifest
 from dapt.knowledge.contracts import KnowledgeDocument
 from dapt.memory import MemorySearchHit
+from dapt.web_targets import derive_sqli_candidate_url, reconstruct_web_urls
 
 from .llm import (
     OpenAICompatiblePlannerLLM,
@@ -163,6 +164,7 @@ _RULES: dict[str, _RuleSpec] = {
 _SYSTEM_PROMPT = """You are the DAPT planner hypothesis generator.
 
 Use only the provided observation, planner state, dependency-graph state, and repo-local knowledge excerpts.
+When benchmark_context is present, treat it as ground-truth challenge metadata for the current CTF benchmark.
 Do not invent hosts, ports, paths, credentials, or tools that are not present in the prompt.
 Return strict JSON with the top-level shape {"candidates": [...]} and no markdown.
 Each candidate must reference supplied knowledge_doc_ids and supporting_evidence values from the prompt.
@@ -481,6 +483,12 @@ class CandidateSynthesizer:
             keywords.update({"http"})
             if any("?" in url or "=" in url for url in observation.evidence.urls):
                 keywords.update({"sql injection", "verification"})
+        if derive_sqli_candidate_url(
+            target_url=current_state.get("target_url"),
+            urls=observation.evidence.urls,
+            file_paths=observation.evidence.file_paths,
+        ):
+            keywords.update({"sql injection", "verification"})
         if any(port in {80, 443, 8080, 8443} for port in observation.evidence.ports):
             keywords.update({"http", "surface mapping"})
         return KnowledgeLookupRequest(
@@ -523,6 +531,7 @@ class CandidateSynthesizer:
         }
         payload = {
             "objective": "Generate grounded planner hypotheses for the current observation.",
+            "benchmark_context": _json_ready_mapping(current_state.get("benchmark_metadata")),
             "observation": {
                 "node_id": observation.node_id,
                 "title": observation.title,
@@ -664,6 +673,7 @@ class CandidateSynthesizer:
                     target_name=target_name,
                     goal=goal,
                     request_parameters=request_parameters,
+                    request_context=request_context,
                 ),
                 title=title,
                 hypothesis=hypothesis,
@@ -818,18 +828,19 @@ class CandidateSynthesizer:
                 metadata={"priority": 50, "generation_mode": "fallback"},
             )
         if hit.doc_id == "sqli-verification":
-            target_url = current_state.get("sqli_candidate_url") or current_state.get("target_url")
-            if not target_url:
+            candidate_url = current_state.get("sqli_candidate_url")
+            if not candidate_url:
                 return None
             return CandidateProposal(
-                candidate_key=f"skill:sqli-verification:{target_url}",
+                candidate_key=f"skill:sqli-verification:{candidate_url}",
                 title=rule.title,
-                hypothesis=f"The current web evidence suggests {target_url} is worth verifying for SQL injection with constrained settings.",
+                hypothesis=f"The current web evidence suggests {candidate_url} is worth verifying for SQL injection with constrained settings.",
                 source_observation_id=observation.node_id,
                 action_kind="skill",
                 target_name=rule.target_name,
                 goal="Verify whether the candidate endpoint is actually vulnerable to SQL injection.",
                 request_parameters={},
+                request_context={"target_url": candidate_url},
                 prerequisites=("state:target-url", "signal:sqli-candidate"),
                 effects=("effect:sqli-verified",),
                 knowledge_hits=(hit,),
@@ -1003,13 +1014,25 @@ def enrich_state_from_observation(current_state: dict[str, Any], observation: Pl
         parsed = urlparse(updated["target_url"])
         if parsed.hostname:
             updated["target_host"] = parsed.hostname
-    if observation.evidence.urls:
-        updated["observed_urls"] = sorted(set(updated.get("observed_urls", [])) | set(observation.evidence.urls))
-        for url in observation.evidence.urls:
-            if "?" in url or "=" in url:
-                updated.setdefault("sqli_candidate_url", url)
+    observed_urls = set(updated.get("observed_urls", []))
+    observed_urls.update(observation.evidence.urls)
+    observed_urls.update(
+        reconstruct_web_urls(
+            target_url=updated.get("target_url"),
+            file_paths=observation.evidence.file_paths,
+        )
+    )
+    if observed_urls:
+        updated["observed_urls"] = sorted(observed_urls)
     if observation.evidence.file_paths:
         updated["observed_paths"] = sorted(set(updated.get("observed_paths", [])) | set(observation.evidence.file_paths))
+    candidate_url = derive_sqli_candidate_url(
+        target_url=updated.get("target_url"),
+        urls=tuple(updated.get("observed_urls", ())),
+        file_paths=tuple(updated.get("observed_paths", ())),
+    )
+    if candidate_url:
+        updated.setdefault("sqli_candidate_url", candidate_url)
     return updated
 
 
@@ -1020,6 +1043,7 @@ def _candidate_key(
     target_name: str,
     goal: str,
     request_parameters: dict[str, Any],
+    request_context: dict[str, Any],
 ) -> str:
     stable_seed = json.dumps(
         {
@@ -1028,6 +1052,7 @@ def _candidate_key(
             "target_name": target_name,
             "goal": goal,
             "request_parameters": request_parameters,
+            "request_context": request_context,
         },
         sort_keys=True,
     )
@@ -1040,6 +1065,7 @@ def _proposal_signature(proposal: CandidateProposal) -> str:
             "action_kind": proposal.action_kind,
             "target_name": proposal.target_name,
             "request_parameters": proposal.request_parameters,
+            "request_context": proposal.request_context,
         },
         sort_keys=True,
     )

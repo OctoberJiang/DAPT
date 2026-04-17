@@ -93,9 +93,12 @@ class Executor:
             )
         except (SchemaValidationError, PreconditionsFailedError, NonRetryableExecutionError) as exc:
             attempts = 1
-            error_output = OutputEnvelope(
-                stderr=str(exc),
-                metadata={"retryable": False, "error_type": type(exc).__name__},
+            error_output = self._augment_output_metadata(
+                request=request,
+                output=OutputEnvelope(
+                    stderr=str(exc),
+                    metadata={"retryable": False, "error_type": type(exc).__name__},
+                ),
             )
             persisted_artifacts.extend(
                 self.artifact_store.persist_output(
@@ -121,11 +124,14 @@ class Executor:
         while attempts <= self.max_retries:
             attempts += 1
             try:
-                output = spec.executor(request)
+                output = self._augment_output_metadata(request=request, output=spec.executor(request))
             except RetryableExecutionError as exc:
-                error_output = OutputEnvelope(
-                    stderr=str(exc),
-                    metadata={"retryable": True, "error_type": type(exc).__name__},
+                error_output = self._augment_output_metadata(
+                    request=request,
+                    output=OutputEnvelope(
+                        stderr=str(exc),
+                        metadata={"retryable": True, "error_type": type(exc).__name__},
+                    ),
                 )
                 persisted_artifacts.extend(
                     self.artifact_store.persist_output(
@@ -150,9 +156,12 @@ class Executor:
                     )
                 continue
             except (SchemaValidationError, PreconditionsFailedError, NonRetryableExecutionError) as exc:
-                error_output = OutputEnvelope(
-                    stderr=str(exc),
-                    metadata={"retryable": False, "error_type": type(exc).__name__},
+                error_output = self._augment_output_metadata(
+                    request=request,
+                    output=OutputEnvelope(
+                        stderr=str(exc),
+                        metadata={"retryable": False, "error_type": type(exc).__name__},
+                    ),
                 )
                 persisted_artifacts.extend(
                     self.artifact_store.persist_output(
@@ -175,9 +184,12 @@ class Executor:
                     ),
                 )
             except Exception as exc:
-                error_output = OutputEnvelope(
-                    stderr=str(exc),
-                    metadata={"retryable": False, "error_type": type(exc).__name__},
+                error_output = self._augment_output_metadata(
+                    request=request,
+                    output=OutputEnvelope(
+                        stderr=str(exc),
+                        metadata={"retryable": False, "error_type": type(exc).__name__},
+                    ),
                 )
                 persisted_artifacts.extend(
                     self.artifact_store.persist_output(
@@ -287,9 +299,12 @@ class Executor:
             self._run_validators(spec.validators, request)
             self._validate_required_state(spec, request)
         except (SchemaValidationError, PreconditionsFailedError, NonRetryableExecutionError) as exc:
-            output = OutputEnvelope(
-                stderr=str(exc),
-                metadata={"skill": spec.name, "step_records": []},
+            output = self._augment_output_metadata(
+                request=request,
+                output=OutputEnvelope(
+                    stderr=str(exc),
+                    metadata={"skill": spec.name, "step_records": []},
+                ),
             )
             artifacts = self.artifact_store.persist_output(
                 request=request,
@@ -371,7 +386,10 @@ class Executor:
                 )
             )
             if step_result.status != "succeeded" and step.on_failure != "continue":
-                combined_output = self._combine_outputs(step_outputs, step_records, spec.name)
+                combined_output = self._augment_output_metadata(
+                    request=request,
+                    output=self._combine_outputs(step_outputs, step_records, spec.name),
+                )
                 all_artifacts.extend(
                     self.artifact_store.persist_output(
                         request=request,
@@ -392,7 +410,10 @@ class Executor:
                     ),
                 )
 
-        combined_output = self._combine_outputs(step_outputs, step_records, spec.name)
+        combined_output = self._augment_output_metadata(
+            request=request,
+            output=self._combine_outputs(step_outputs, step_records, spec.name),
+        )
         all_artifacts.extend(
             self.artifact_store.persist_output(
                 request=request,
@@ -538,3 +559,11 @@ class Executor:
 
     def _elapsed_since(self, started_at: float) -> float:
         return perf_counter() - started_at
+
+    def _augment_output_metadata(self, *, request: ExecutionRequest, output: OutputEnvelope) -> OutputEnvelope:
+        metadata = dict(output.metadata)
+        if request.context.get("target_url") and "request_target_url" not in metadata:
+            metadata["request_target_url"] = request.context["target_url"]
+        if request.context.get("target_host") and "request_target_host" not in metadata:
+            metadata["request_target_host"] = request.context["target_host"]
+        return replace(output, metadata=metadata)

@@ -19,6 +19,7 @@ from dapt.executor import (
     build_pentest_tool_registry,
     build_reference_registry,
 )
+from dapt.executor.pentest.native import HttpResponse
 
 
 class ExecutorProofTests(unittest.TestCase):
@@ -268,6 +269,41 @@ class PentestToolCatalogTests(unittest.TestCase):
         self.assertIn("-sV", command)
         self.assertIn("-p", command)
         self.assertIn("--script", command)
+
+    def test_nmap_uses_native_fallback_when_binary_is_missing(self) -> None:
+        request = ExecutionRequest(
+            request_id="nmap-native-fallback",
+            target_name="nmap",
+            action_kind="tool",
+            parameters={"target": "127.0.0.1"},
+            context={"target_url": "http://127.0.0.1:56587/"},
+        )
+
+        def fake_scan(target, *, ports, timeout_seconds, target_url=None, service_detection=True):
+            self.assertEqual(target, "127.0.0.1")
+            self.assertIn(56587, ports)
+            self.assertEqual(target_url, "http://127.0.0.1:56587/")
+            self.assertTrue(service_detection)
+            return [
+                {
+                    "port": 56587,
+                    "protocol": "tcp",
+                    "state": "open",
+                    "service": "http",
+                    "version": 'SimpleHTTP title="Trading Platform"',
+                }
+            ]
+
+        with patch("dapt.executor.pentest.cli.shutil.which", return_value=None), patch(
+            "dapt.executor.pentest.tools.nmap.scan_tcp_ports",
+            side_effect=fake_scan,
+        ):
+            result = self.executor.execute(request)
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.effects["open_port_count"], 1)
+        self.assertEqual(result.effects["open_ports"][0]["port"], 56587)
+        self.assertEqual(result.output.metadata["implementation"], "native")
 
     def test_gobuster_command_assembly_and_parser(self) -> None:
         request = ExecutionRequest(
@@ -522,6 +558,93 @@ class PentestWebSkillTests(unittest.TestCase):
         self.assertEqual(result.usage.tool_invocations, 2)
         executed_tools = [call.args[0][0] for call in run_mock.call_args_list]
         self.assertEqual(executed_tools, ["nmap", "zap-baseline.py"])
+
+    def test_web_surface_mapping_uses_native_fallbacks_for_benchmark_style_target(self) -> None:
+        request = ExecutionRequest(
+            request_id="web-surface-native-benchmark",
+            target_name="web-surface-mapping",
+            action_kind="skill",
+            parameters={},
+            context={
+                "target_host": "127.0.0.1",
+                "target_url": "http://127.0.0.1:56587/",
+            },
+        )
+
+        def fake_scan(target, *, ports, timeout_seconds, target_url=None, service_detection=True):
+            self.assertEqual(target, "127.0.0.1")
+            self.assertIn(56587, ports)
+            self.assertEqual(target_url, "http://127.0.0.1:56587/")
+            return [
+                {
+                    "port": 56587,
+                    "protocol": "tcp",
+                    "state": "open",
+                    "service": "http",
+                    "version": "Python http.server",
+                }
+            ]
+
+        with (
+            patch("dapt.executor.pentest.cli.shutil.which", return_value=None),
+            patch("dapt.executor.pentest.tools.nmap.scan_tcp_ports", side_effect=fake_scan),
+            patch(
+                "dapt.executor.pentest.tools.zap.fetch_url",
+                return_value=HttpResponse(
+                    url="http://127.0.0.1:56587/",
+                    status=200,
+                    headers={"Server": "Werkzeug", "Content-Type": "text/html"},
+                    body_length=512,
+                    title="Trading Platform",
+                ),
+            ),
+        ):
+            result = self.executor.execute(request)
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.effects["steps_run"], ["discover-http-services", "baseline-web-scan"])
+        self.assertTrue(result.effects["http_exposed"])
+        self.assertEqual(result.effects["open_ports"][0]["port"], 56587)
+        self.assertGreaterEqual(result.effects["zap_alert_counts"].get("info", 0), 1)
+
+    def test_content_discovery_uses_native_gobuster_when_binaries_are_missing(self) -> None:
+        request = ExecutionRequest(
+            request_id="content-native-gobuster",
+            target_name="content-discovery",
+            action_kind="skill",
+            parameters={"wordlist_path": str(self.wordlist_path)},
+            context={"target_url": "https://example.test"},
+        )
+
+        def fake_fetch(url, *, timeout_seconds, headers=None, follow_redirects=True):
+            if url.endswith("/admin"):
+                return HttpResponse(
+                    url=url,
+                    status=200,
+                    headers={"Content-Type": "text/html"},
+                    body_length=321,
+                    title="Admin",
+                )
+            return HttpResponse(
+                url=url,
+                status=404,
+                headers={"Content-Type": "text/html"},
+                body_length=0,
+                title=None,
+            )
+
+        with patch("dapt.executor.pentest.cli.shutil.which", return_value=None), patch(
+            "dapt.executor.pentest.tools.gobuster.fetch_url",
+            side_effect=fake_fetch,
+        ):
+            result = self.executor.execute(request)
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertFalse(result.effects["fallback_used"])
+        self.assertEqual(result.effects["selected_tool"], "gobuster")
+        self.assertEqual(result.effects["finding_count"], 1)
+        self.assertEqual(result.effects["findings"][0]["path"], "/admin")
+        self.assertEqual(result.output.metadata["request_target_url"], "https://example.test")
 
     def test_content_discovery_falls_back_from_gobuster_to_ffuf(self) -> None:
         request = ExecutionRequest(
