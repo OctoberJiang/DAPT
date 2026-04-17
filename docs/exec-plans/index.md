@@ -39,3 +39,4 @@
 - `8_6_rerun-benchmark-01-and-inspect-final-output`: completed a fresh benchmark-01 rerun, captured both sandbox-blocked and escalated outcomes, and inspected the final frontier-blocked planner output.
 - `8_7_trace-benchmark-01-frontier-block`: completed a cross-layer trace of the benchmark-01 frontier block and identified the primary planner/perceptor and secondary executor fix points.
 - `8_8_primary-fix-sqli-candidate-reconstruction`: completed the planner/perceptor SQLi-candidate reconstruction fix so relative web-path discoveries now yield executable SQLi verification targets.
+- `8_9_rerun-benchmark-01-after-sqli-candidate-fix`: completed a post-fix benchmark-01 rerun and confirmed the planner now executes SQLi verification before stopping on missing `sqlmap` and no further actionable candidates.
