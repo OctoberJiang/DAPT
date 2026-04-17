@@ -41,3 +41,4 @@
 - `8_8_primary-fix-sqli-candidate-reconstruction`: completed the planner/perceptor SQLi-candidate reconstruction fix so relative web-path discoveries now yield executable SQLi verification targets.
 - `8_9_rerun-benchmark-01-after-sqli-candidate-fix`: completed a post-fix benchmark-01 rerun and confirmed the planner now executes SQLi verification before stopping on missing `sqlmap` and no further actionable candidates.
 - `8_10_audit-tool-executables-on-path`: completed a repo-local PATH audit for every registered pentest executable and identified which missing binaries are tolerated by native fallbacks versus which ones currently block planner-executed skills.
+- `8_11_fix-security-tool-executable-resolution`: completed repo-wide pentest command resolution, wired repo-local overrides for non-PATH tools, surfaced host-platform mismatches for PEAS payloads, and confirmed benchmark 01 now executes `sqlmap` instead of failing on executable lookup.

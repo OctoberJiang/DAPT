@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from errno import ENOEXEC
 from pathlib import Path
 from subprocess import CompletedProcess, TimeoutExpired
 from unittest.mock import patch
@@ -416,6 +417,166 @@ class PentestToolCatalogTests(unittest.TestCase):
         self.assertIn("--technique", command)
         self.assertIn("--batch", command)
 
+    def test_sqlmap_uses_alias_when_primary_executable_name_is_missing(self) -> None:
+        request = ExecutionRequest(
+            request_id="sqlmap-alias",
+            target_name="sqlmap",
+            action_kind="tool",
+            parameters={"target_url": "https://example.test/item?id=1"},
+        )
+
+        with (
+            patch(
+                "dapt.executor.pentest.cli.shutil.which",
+                side_effect=lambda executable: "/usr/local/bin/sqlmap.py" if executable == "sqlmap.py" else None,
+            ),
+            patch(
+                "dapt.executor.pentest.cli.subprocess.run",
+                return_value=CompletedProcess(args=["sqlmap.py"], returncode=0, stdout="", stderr=""),
+            ) as run_mock,
+        ):
+            result = self.executor.execute(request)
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(run_mock.call_args.args[0][0], "/usr/local/bin/sqlmap.py")
+
+    def test_sqlmap_configured_command_prefix_is_used_from_repo_config(self) -> None:
+        (self.repo_root / "dapt.config.json").write_text(
+            '{"pentest":{"tool_commands":{"sqlmap":["python3","tools/sqlmap.py"]}}}',
+            encoding="utf-8",
+        )
+        tools_dir = self.repo_root / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "sqlmap.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        registry = build_pentest_tool_registry(repo_root=self.repo_root)
+        executor = Executor(
+            registry=registry,
+            artifact_store=ArtifactStoreLayout(repo_root=self.repo_root),
+            max_retries=1,
+        )
+        request = ExecutionRequest(
+            request_id="sqlmap-configured",
+            target_name="sqlmap",
+            action_kind="tool",
+            parameters={"target_url": "https://example.test/item?id=1"},
+        )
+
+        with (
+            patch("dapt.executor.pentest.cli.shutil.which", side_effect=lambda executable: "/usr/bin/python3" if executable == "python3" else None),
+            patch(
+                "dapt.executor.pentest.cli.subprocess.run",
+                return_value=CompletedProcess(args=["python3"], returncode=0, stdout="", stderr=""),
+            ) as run_mock,
+        ):
+            result = executor.execute(request)
+
+        self.assertEqual(result.status, "succeeded")
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[0], "/usr/bin/python3")
+        self.assertEqual(command[1], str((self.repo_root / "tools" / "sqlmap.py").resolve()))
+
+    def test_netexec_configured_command_supports_env_prefixed_repo_local_binary(self) -> None:
+        (self.repo_root / "dapt.config.json").write_text(
+            (
+                '{"pentest":{"tool_commands":{"netexec":['
+                '"env","NXC_PATH=./.nxc",".venv-tools/bin/netexec"'
+                "]}}}"
+            ),
+            encoding="utf-8",
+        )
+        venv_bin = self.repo_root / ".venv-tools" / "bin"
+        venv_bin.mkdir(parents=True)
+        (venv_bin / "netexec").write_text("#!/bin/sh\n", encoding="utf-8")
+        registry = build_pentest_tool_registry(repo_root=self.repo_root)
+        executor = Executor(
+            registry=registry,
+            artifact_store=ArtifactStoreLayout(repo_root=self.repo_root),
+            max_retries=1,
+        )
+        request = ExecutionRequest(
+            request_id="netexec-configured",
+            target_name="netexec",
+            action_kind="tool",
+            parameters={
+                "target_host": "dc.example.test",
+                "protocol": "smb",
+                "username": "demo",
+                "password": "demo",
+            },
+        )
+
+        def which_side_effect(executable: str) -> str | None:
+            if executable == "env":
+                return "/usr/bin/env"
+            return None
+
+        with (
+            patch("dapt.executor.pentest.cli.shutil.which", side_effect=which_side_effect),
+            patch(
+                "dapt.executor.pentest.cli.subprocess.run",
+                return_value=CompletedProcess(args=["env"], returncode=0, stdout="", stderr=""),
+            ) as run_mock,
+        ):
+            result = executor.execute(request)
+
+        self.assertEqual(result.status, "succeeded")
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[0], "/usr/bin/env")
+        self.assertEqual(command[1], f"NXC_PATH={str((self.repo_root / '.nxc').resolve())}")
+        self.assertEqual(command[2], str((self.repo_root / ".venv-tools" / "bin" / "netexec").resolve()))
+
+    def test_missing_executable_error_lists_checked_alias_candidates(self) -> None:
+        request = ExecutionRequest(
+            request_id="sqlmap-missing",
+            target_name="sqlmap",
+            action_kind="tool",
+            parameters={"target_url": "https://example.test/item?id=1"},
+        )
+
+        with patch("dapt.executor.pentest.cli.shutil.which", return_value=None):
+            result = self.executor.execute(request)
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("No runnable command found for tool 'sqlmap'", result.error_message or "")
+        self.assertIn("'sqlmap.py'", result.error_message or "")
+
+    def test_winpeas_reports_controller_platform_mismatch_before_path_lookup(self) -> None:
+        request = ExecutionRequest(
+            request_id="winpeas-platform",
+            target_name="winpeas",
+            action_kind="tool",
+            parameters={},
+        )
+
+        with patch("dapt.executor.pentest.cli.sys.platform", "darwin"), patch(
+            "dapt.executor.pentest.cli.shutil.which"
+        ) as which_mock:
+            result = self.executor.execute(request)
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("Windows privilege-escalation payload", result.error_message or "")
+        which_mock.assert_not_called()
+
+    def test_host_incompatible_binary_reports_non_retryable_reason(self) -> None:
+        request = ExecutionRequest(
+            request_id="host-incompatible",
+            target_name="sqlmap",
+            action_kind="tool",
+            parameters={"target_url": "https://example.test/item?id=1"},
+        )
+
+        with (
+            patch("dapt.executor.pentest.cli.shutil.which", return_value="/tmp/demo.exe"),
+            patch(
+                "dapt.executor.pentest.cli.subprocess.run",
+                side_effect=OSError(ENOEXEC, "Exec format error"),
+            ),
+        ):
+            result = self.executor.execute(request)
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("not runnable on this host", result.error_message or "")
+
     def test_zap_parser_counts_alert_prefixes(self) -> None:
         request = ExecutionRequest(
             request_id="zap-success",
@@ -523,7 +684,8 @@ class PentestWebSkillTests(unittest.TestCase):
         )
 
         def fake_run(command, **_kwargs):
-            if command[0] == "nmap":
+            tool = Path(command[0]).name
+            if tool == "nmap":
                 return CompletedProcess(
                     args=command,
                     returncode=0,
@@ -534,7 +696,7 @@ class PentestWebSkillTests(unittest.TestCase):
                     ),
                     stderr="",
                 )
-            if command[0] == "zap-baseline.py":
+            if tool == "zap-baseline.py":
                 return CompletedProcess(
                     args=command,
                     returncode=0,
@@ -556,7 +718,7 @@ class PentestWebSkillTests(unittest.TestCase):
         self.assertIsNotNone(result.usage)
         assert result.usage is not None
         self.assertEqual(result.usage.tool_invocations, 2)
-        executed_tools = [call.args[0][0] for call in run_mock.call_args_list]
+        executed_tools = [Path(call.args[0][0]).name for call in run_mock.call_args_list]
         self.assertEqual(executed_tools, ["nmap", "zap-baseline.py"])
 
     def test_web_surface_mapping_uses_native_fallbacks_for_benchmark_style_target(self) -> None:
@@ -656,14 +818,15 @@ class PentestWebSkillTests(unittest.TestCase):
         )
 
         def fake_run(command, **_kwargs):
-            if command[0] == "gobuster":
+            tool = Path(command[0]).name
+            if tool == "gobuster":
                 return CompletedProcess(
                     args=command,
                     returncode=1,
                     stdout="",
                     stderr="transient gobuster failure",
                 )
-            if command[0] == "ffuf":
+            if tool == "ffuf":
                 return CompletedProcess(
                     args=command,
                     returncode=0,
@@ -685,7 +848,7 @@ class PentestWebSkillTests(unittest.TestCase):
         self.assertTrue(result.effects["fallback_used"])
         self.assertEqual(result.effects["selected_tool"], "ffuf")
         self.assertEqual(result.effects["finding_count"], 1)
-        executed_tools = [call.args[0][0] for call in run_mock.call_args_list]
+        executed_tools = [Path(call.args[0][0]).name for call in run_mock.call_args_list]
         self.assertEqual(executed_tools, ["gobuster", "ffuf"])
 
     def test_content_discovery_stops_when_fallback_is_disabled(self) -> None:
@@ -895,6 +1058,7 @@ class PentestCredentialCatalogTests(unittest.TestCase):
         )
 
         with (
+            patch("dapt.executor.pentest.cli.sys.platform", "linux"),
             patch("dapt.executor.pentest.cli.shutil.which", return_value="/usr/bin/linpeas.sh"),
             patch(
                 "dapt.executor.pentest.cli.subprocess.run",
@@ -955,14 +1119,15 @@ class PentestCredentialSkillTests(unittest.TestCase):
         )
 
         def fake_run(command, **_kwargs):
-            if command[0] == "netexec":
+            tool = Path(command[0]).name
+            if tool == "netexec":
                 return CompletedProcess(
                     args=command,
                     returncode=0,
                     stdout="WINRM 10.0.0.30 5985 HOST [+] test.local\\alice:Spring2024!",
                     stderr="",
                 )
-            if command[0] == "evil-winrm":
+            if tool == "evil-winrm":
                 return CompletedProcess(
                     args=command,
                     returncode=0,
@@ -980,7 +1145,10 @@ class PentestCredentialSkillTests(unittest.TestCase):
         self.assertEqual(result.status, "succeeded")
         self.assertTrue(result.effects["authenticated"])
         self.assertTrue(result.effects["winrm_connected"])
-        self.assertEqual([call.args[0][0] for call in run_mock.call_args_list], ["netexec", "evil-winrm"])
+        self.assertEqual(
+            [Path(call.args[0][0]).name for call in run_mock.call_args_list],
+            ["netexec", "evil-winrm"],
+        )
 
     def test_asrep_roast_collection_aggregates_hashes(self) -> None:
         request = ExecutionRequest(
@@ -996,14 +1164,15 @@ class PentestCredentialSkillTests(unittest.TestCase):
         )
 
         def fake_run(command, **_kwargs):
-            if command[0] == "kerbrute":
+            tool = Path(command[0]).name
+            if tool == "kerbrute":
                 return CompletedProcess(
                     args=command,
                     returncode=0,
                     stdout="VALID USERNAME: alice@test.local",
                     stderr="",
                 )
-            if command[0] == "GetNPUsers.py":
+            if tool == "GetNPUsers.py":
                 return CompletedProcess(
                     args=command,
                     returncode=0,
@@ -1062,6 +1231,7 @@ class PentestCredentialSkillTests(unittest.TestCase):
         )
 
         with (
+            patch("dapt.executor.pentest.cli.sys.platform", "linux"),
             patch("dapt.executor.pentest.cli.shutil.which", side_effect=lambda executable: f"/usr/bin/{executable}"),
             patch(
                 "dapt.executor.pentest.cli.subprocess.run",

@@ -1,0 +1,63 @@
+{
+  "config_version": 1,
+  "planner": {
+    "llm": {
+      "enabled": true,
+      "provider": "deepseek",
+      "model": "deepseek-reasoner",
+      "api_base_url": "https://api.deepseek.com/v1",
+      "api_key": "sk-166562ca7ece42b098387a44f47f6299",
+      "api_key_env_var": null,
+      "temperature": 0.2,
+      "max_output_tokens": 1200,
+      "timeout_seconds": 30.0,
+      "extra_headers": {},
+      "pricing": {
+        "input_cost_cny_per_1k_tokens": 0.0,
+        "output_cost_cny_per_1k_tokens": 0.0
+      }
+    },
+    "budget": {
+      "max_runtime_seconds": 300.0,
+      "max_tool_calls": 40,
+      "max_llm_cost_cny": null
+    }
+  },
+  "evaluation": {
+    "benchmarks": "1",
+    "benchmark_root": "XBOW-benchmarks/benchmarks",
+    "run_id": null,
+    "max_turns": 10,
+    "build": true,
+    "bring_up": true,
+    "tear_down": true
+  },
+  "report": {
+    "session_dir": null,
+    "format": "markdown",
+    "output": null
+  },
+  "pentest": {
+    "tool_commands": {
+      "netexec": [
+        "env",
+        "NXC_PATH=./.nxc",
+        ".venv-tools/bin/netexec"
+      ],
+      "evil-winrm": [
+        "env",
+        "GEM_HOME=./.gem-tools",
+        ".gem-tools/bin/evil-winrm"
+      ],
+      "kerbrute": [
+        ".go-tools/bin/kerbrute"
+      ],
+      "impacket-getnpusers": [
+        ".venv-tools/bin/GetNPUsers.py"
+      ],
+      "impacket-getuserspns": [
+        ".venv-tools/bin/GetUserSPNs.py"
+      ]
+    }
+  }
+}
